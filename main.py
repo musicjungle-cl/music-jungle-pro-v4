@@ -5,13 +5,12 @@ import time
 import requests
 import re
 
-# ============== HELPERS & LOG LOGIC ==============
-if "results_list" not in st.session_state:
-    st.session_state.results_list = []
+# ============== LOGICA DE LIMPIEZA (REGEX) ==============
 
-def normalize_artist(raw_name):
-    if not raw_name: return "Unknown"
-    return re.sub(r"\s\(\d+\)$", "", raw_name).strip()
+def clean_extra_info(text):
+    """Elimina números entre paréntesis al final: 'Artist (2)' -> 'Artist'"""
+    if not text: return ""
+    return re.sub(r"\s\(\d+\)$", "", str(text)).strip()
 
 def get_categoria(fmt_name, descriptions):
     joined = (str(fmt_name) + " " + " ".join(descriptions or [])).lower()
@@ -30,21 +29,23 @@ def build_comentario(estado, seller, categoria):
 # ============== MOTORES DE BÚSQUEDA ==============
 
 def fetch_discogs(dclient, item):
+    """Motor Principal con control de ritmo estricto"""
     try:
-        time.sleep(0.9) # Safe rate
+        # Respetamos el límite de 60 req/min con margen de seguridad
+        time.sleep(1.2) 
         res = dclient.search(barcode=item, type='release') if item.isdigit() else dclient.search(catno=item, type='release')
+        
         if res.count > 0:
             rel = res[0]
             fmt = rel.formats[0] if rel.formats else {"name": "CD", "descriptions": []}
-            cat = get_categoria(fmt.get("name"), fmt.get("descriptions"))
             return {
                 "Barcode": item if item.isdigit() else "",
-                "Cat No": getattr(rel.labels[0], "catno", item) if rel.labels else item,
-                "Artista": normalize_artist(rel.artists[0].name) if rel.artists else "Unknown",
+                "Cat No": clean_extra_info(getattr(rel.labels[0], "catno", item)) if rel.labels else item,
+                "Artista": clean_extra_info(rel.artists[0].name) if rel.artists else "Unknown",
                 "Título": rel.title,
-                "Categoría": cat,
+                "Categoría": get_categoria(fmt.get("name"), fmt.get("descriptions")),
                 "Formato": f"{fmt.get('name')}, {', '.join(fmt.get('descriptions', []))}",
-                "Discográfica": rel.labels[0].name if rel.labels else "",
+                "Discográfica": clean_extra_info(rel.labels[0].name) if rel.labels else "",
                 "País": getattr(rel, "country", ""),
                 "Año": getattr(rel, "year", ""),
                 "Tags": ", ".join(rel.styles or rel.genres or []),
@@ -56,60 +57,84 @@ def fetch_discogs(dclient, item):
         if "429" in str(e): return "RATE_LIMIT"
     return None
 
-def fetch_itunes(item):
+def fetch_musicbrainz(item):
+    """Fallback de alta calidad para discográfica y tracklist"""
     try:
-        url = f"https://itunes.apple.com/lookup?upc={item}&entity=album"
-        r = requests.get(url, timeout=5).json()
-        if r.get('resultCount', 0) > 0:
-            res = r['results'][0]
+        time.sleep(1.1) # Límite estricto de MusicBrainz
+        url = f"https://musicbrainz.org/ws/2/release/?query=barcode:{item}&fmt=json"
+        headers = {'User-Agent': 'MusicJungleBot/4.6 (contacto@musicjungle.cl)'}
+        r = requests.get(url, headers=headers, timeout=10).json()
+        
+        if r.get('releases'):
+            rel = r['releases'][0]
+            # Extraer discográfica de MB
+            label = "Unknown"
+            if rel.get('label-info'):
+                label = rel['label-info'][0].get('label', {}).get('name', 'Unknown')
+            
             return {
                 "Barcode": item, "Cat No": item,
-                "Artista": res.get("artistName"), "Título": res.get("collectionName"),
-                "Categoría": "CD", "Formato": "CD, Album",
-                "Discográfica": "iTunes Search", "País": "US", "Año": res.get("releaseDate", "")[:4],
-                "Tags": res.get("primaryGenreName", ""), "Tracklist": "Ver en App",
-                "Link fotos": res.get("artworkUrl100", "").replace("100x100bb", "600x600bb"),
-                "Fuente": "iTunes"
+                "Artista": clean_extra_info(rel.get('artist-credit', [{}])[0].get('name')),
+                "Título": rel.get('title'),
+                "Categoría": "CD", # MB es más complejo de mapear, default CD
+                "Formato": "Album",
+                "Discográfica": clean_extra_info(label),
+                "País": rel.get('country', 'Unknown'),
+                "Año": rel.get('date', "")[:4],
+                "Tags": "Music",
+                "Tracklist": "Metadata MB disponible",
+                "Link fotos": "",
+                "Fuente": "MusicBrainz"
             }
     except: pass
     return None
 
-# ============== INTERFAZ STREAMLIT ==============
+# ============== UI STREAMLIT ==============
 
-st.set_page_config(page_title="MJ DEVELOPER - Music Jungle Pro", layout="wide")
-st.title("📀 Generador de Matriz Music Jungle")
+st.set_page_config(page_title="Music Jungle Pro v4.6", layout="wide")
+st.title("📀 Generador de Matriz Music Jungle (High Precision)")
 
 with st.sidebar:
-    st.header("⚙️ Parámetros Globales")
+    st.header("⚙️ Configuración")
     token = st.text_input("Discogs Token", type="password")
     vendedor = st.selectbox("Vendedor", ["MusicJungleCL", "Vintage Jungle", "PondisonOsben", "FDC", "PMS", "GLD"])
     estado_global = st.radio("Estado de Importación", ["Nuevo", "Usado"])
     condicion = st.selectbox("Condición (Disco/Carátula)", ["Mint (M)", "Near Mint (NM)", "Very Good Plus (VG+)", "Very Good (VG)"])
     
     st.divider()
-    fallback_mode = st.toggle("Auto-Fallback (MB/iTunes)", value=True)
+    st.info("Pausa de seguridad: 1.2s entre discos para evitar baneos de Discogs.")
+
+if "results_list" not in st.session_state:
+    st.session_state.results_list = []
 
 raw_input = st.text_area("Lista de Barcodes o Cat Nos:", height=150)
 input_list = [x.strip() for x in re.split(r'[\n,]', raw_input) if x.strip()]
 
 if input_list:
-    if st.button("🚀 Generar Matriz"):
-        dclient = discogs_client.Client("MusicJungleApp/4.5", user_token=token) if token else None
+    if st.button("🚀 Iniciar Importación Controlada"):
+        dclient = discogs_client.Client("MusicJungleApp/4.6", user_token=token) if token else None
         pbar = st.progress(0)
+        status = st.empty()
         
         for idx, item in enumerate(input_list):
-            data = None
-            # 1. Intentar Discogs
-            if dclient:
-                data = fetch_discogs(dclient, item)
+            # No procesar duplicados en la misma sesión
+            if any(res['ID_Search'] == item for res in st.session_state.results_list):
+                continue
+                
+            status.text(f"Buscando {item}...")
+            data = fetch_discogs(dclient, item)
             
-            # 2. Fallback si falla o no hay datos
-            if (not data or data == "RATE_LIMIT") and fallback_mode and item.isdigit():
-                st.warning(f"Usando Fallback para {item}...")
-                data = fetch_itunes(item)
+            # Gestión de Bloqueo / Retoma
+            if data == "RATE_LIMIT":
+                st.error("🛑 Límite de Discogs alcanzado. Esperando 30 segundos para reintentar con MusicBrainz...")
+                time.sleep(30)
+                data = fetch_musicbrainz(item)
+            
+            if not data:
+                data = fetch_musicbrainz(item)
             
             if data and isinstance(data, dict):
-                # Aplicar Reglas de Negocio MJ
+                data["ID_Search"] = item
                 data["Estado"] = estado_global
                 data["Condición Disco"] = condicion
                 data["Condición Caratula"] = condicion
@@ -117,16 +142,18 @@ if input_list:
                 data["Precio"] = ""
                 data["Stock"] = 1
                 data["Vendedor"] = vendedor
-                data["Comentario"] = build_comentario(estado_global, vendedor, data["Categoría"])
+                data["Comentario"] = build_comentario(estado_global, vendedor, data.get("Categoría", "CD"))
                 
                 st.session_state.results_list.append(data)
+                st.toast(f"Cargado: {data['Artista']}")
+            else:
+                st.warning(f"No se encontró metadata para: {item}")
             
             pbar.progress((idx + 1) / len(input_list))
+        status.text("✅ Proceso finalizado.")
 
 if st.session_state.results_list:
     df = pd.DataFrame(st.session_state.results_list)
-    
-    # Asegurar el orden exacto de las columnas solicitado
     columns_mj = [
         "Barcode", "Cat No", "Artista", "Título", "Categoría", "Formato", 
         "Estado", "Condición Disco", "Condición Caratula", "Discográfica", 
@@ -134,12 +161,10 @@ if st.session_state.results_list:
         "Tracklist", "Link fotos", "Comentario"
     ]
     
-    # Reindexar y añadir ID
     final_df = df.reindex(columns=columns_mj)
     final_df.insert(0, 'ID', range(1, 1 + len(final_df)))
     
-    st.subheader("📋 Vista Previa de Matriz")
     st.dataframe(final_df, use_container_width=True)
     
     csv = final_df.to_csv(index=False).encode('utf-8')
-    st.download_button("⬇️ Descargar CSV Music Jungle", data=csv, file_name="Matriz_MusicJungle.csv", mime="text/csv")
+    st.download_button("⬇️ Descargar Matriz CSV", data=csv, file_name="Matriz_MusicJungle_Pro.csv", mime="text/csv")
